@@ -1,0 +1,73 @@
+resolution:
+  width: 1920
+  height: 1080
+
+camera:
+  pos: [0, 5, -10]
+  dir: [0, 0, 1]
+  fov: 65
+
+ambient: [30, 30, 40]
+background: [10, 120, 20]
+
+materials:
+  matte_floor:
+    albedo: [90, 95, 100]
+    roughness: 0.8
+    metallic: 0.0
+
+  brushed_metal:
+    albedo: [200, 200, 210]
+    roughness: 0.25
+    metallic: 1.0
+
+  warm_glass:
+    albedo: [255, 245, 230]
+    transparency: 1.0
+    ior: 1.5
+    roughness: 0.02
+
+  mirror:
+    albedo: [255, 255, 255]
+    roughness: 0.0
+    metallic: 1.0
+
+objects:
+  # Floor
+  - type: plane
+    pos: [0, -1.5, 0]
+    normal: [0, 1, 0]
+    material: matte_floor
+
+  # Back mirror wall
+  - type: plane
+    pos: [0, 0, -18]
+    normal: [0, 0, 1]
+    material: mirror
+
+  # Central glass sphere
+  - type: sphere
+    pos: [0, 0, -6]
+    radius: 1.4
+    material: warm_glass
+
+  # Metal spheres
+  - type: sphere
+    pos: [-3.2, -0.6, -5]
+    radius: 0.9
+    material: brushed_metal
+
+  - type: sphere
+    pos: [3.0, -0.4, -7]
+    radius: 1.1
+    material: brushed_metal
+
+lights:
+  - pos: [4, 6, 4]
+    intensity: 1.4
+
+  - pos: [-6, 3, 2]
+    intensity: 0.9
+
+  - pos: [0, 8, -10]
+    intensity: 1.1
