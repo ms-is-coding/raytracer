@@ -30,7 +30,8 @@ ROOT_DIR	:= $(BUILD_DIR)/$(MODE)
 OBJ_DIR		:= $(ROOT_DIR)/obj
 
 SRC_SCENE := $(addprefix scene/, reader.c lexer.c parser.c error.c)
-SRC_FILES		:= $(SRC_SCENE) main.c opencl.c watcher.c bvh.c cpu_render.c print.c
+SRC_UI := $(addprefix ui/, ui.c color.c rect.c switch.c slider.c button.c label.c panel.c color_picker.c)
+SRC_FILES		:= $(SRC_SCENE) $(SRC_UI) main.c opencl.c watcher.c bvh.c cpu_render.c print.c
 
 SRCS			:= $(addprefix $(SRC_DIR)/, $(SRC_FILES))
 OBJS			:= $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
