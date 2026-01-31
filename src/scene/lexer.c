@@ -12,16 +12,19 @@ void lexer_init(t_lexer *lex, t_file file) {
   lex->line_indent = 0;
 }
 
-static int at_end(t_lexer *lex) {
+__attribute__((__always_inline__))
+static inline int at_end(t_lexer *lex) {
   return lex->cursor >= lex->file.data + lex->file.size;
 }
 
-static char peek_char(t_lexer *lex) {
+__attribute__((__always_inline__))
+static inline char peek_char(t_lexer *lex) {
   if (at_end(lex)) return '\0';
   return *lex->cursor;
 }
 
-static char advance(t_lexer *lex) {
+__attribute__((__always_inline__))
+static inline char advance(t_lexer *lex) {
   if (at_end(lex)) return '\0';
   return *lex->cursor++;
 }

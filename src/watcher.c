@@ -84,7 +84,7 @@ void check_for_scene_updates(t_data *data) {
     // 3. Free old BVH and rebuild
     free_bvh(&data->scene);
     build_bvh(&data->scene);
-    debug_print_bvh(&data->scene);
+    // debug_print_bvh(&data->scene);
 
     // 4. Update OpenCL buffers
     cl_int err;

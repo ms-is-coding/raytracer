@@ -33,7 +33,7 @@ typedef struct { float major, minor; } t_torus;
 typedef struct { float radius, width; } t_mobius;
 
 typedef struct {
-  int type; // 0: Sphere, 1: Plane
+  t_object_type type;
   int material_id;
   float4 pos;
   float4 rot;
@@ -60,7 +60,7 @@ typedef struct {
   float4 color;
   float intensity;
   float angle;
-  int type;
+  t_light_type type;
   float padding;
 } t_light;
 
@@ -99,8 +99,338 @@ float intersect_aabb(float3 ro, float3 inv_rd, t_aabb box) {
   return tmin;
 }
 
+// GPU-optimized BVH node (matches t_bvh_node_gpu)
+typedef struct {
+  float4 bbox_min;
+  float4 bbox_max;
+  int child[2];
+  int prim_count[2];
+  int parent;
+  int axis;
+  int pad[2];
+} bvh_node_gpu;
+
+// Branchless AABB intersection with precomputed inv_dir and dir_sign
+// Returns (tmin, tmax) packed in float2, use tmax < 0 || tmin > tmax for miss
+float2 intersect_aabb_gpu(float3 ro, float3 inv_rd, int3 dir_sign,
+                          float3 bbox_min, float3 bbox_max) {
+  // Select bounds based on ray direction sign (branchless)
+  float3 bounds0 = select(bbox_min, bbox_max, dir_sign);
+  float3 bounds1 = select(bbox_max, bbox_min, dir_sign);
+
+  float3 t0 = (bounds0 - ro) * inv_rd;
+  float3 t1 = (bounds1 - ro) * inv_rd;
+
+  float tmin = fmax(fmax(t0.x, t0.y), t0.z);
+  float tmax = fmin(fmin(t1.x, t1.y), t1.z);
+
+  return (float2)(tmin, tmax);
+}
+
+// SoA primitive buffers for coalesced access
+// pos.w contains type as int bits, param0.w contains material_id
+float intersect_prim_soa(float3 ro, float3 rd,
+                         __global float4 *prim_pos,
+                         __global float4 *prim_param0,
+                         __global float4 *prim_param1,
+                         int idx) {
+  float4 pos4 = prim_pos[idx];
+  float3 p = pos4.xyz;
+  int type = as_int(pos4.w);
+  float4 param0 = prim_param0[idx];
+
+  float3 oc = ro - p;
+
+  if (type == TYPE_SPHERE) {
+    float r = param0.x;
+    float b = dot(oc, rd);
+    float c = dot(oc, oc) - r * r;
+    float h = b * b - c;
+    if (h < 0.0f) return -1.0f;
+    h = sqrt(h);
+    float t = -b - h;
+    return (t > 0.001f) ? t : ((-b + h > 0.001f) ? -b + h : -1.0f);
+  }
+  else if (type == TYPE_PLANE) {
+    float4 param1 = prim_param1[idx];
+    float3 n = param1.xyz;
+    float denom = dot(n, rd);
+    if (fabs(denom) > 1e-6f) {
+      float t = dot(p - ro, n) / denom;
+      return (t > 0.001f) ? t : -1.0f;
+    }
+    return -1.0f;
+  }
+  else if (type == TYPE_BOX) {
+    float3 hs = param0.xyz;
+    float3 t1 = (-hs - oc) / rd;
+    float3 t2 = (hs - oc) / rd;
+    float3 tmin3 = fmin(t1, t2);
+    float3 tmax3 = fmax(t1, t2);
+    float tmin = fmax(fmax(tmin3.x, tmin3.y), tmin3.z);
+    float tmax = fmin(fmin(tmax3.x, tmax3.y), tmax3.z);
+    if (tmax < 0.0f || tmin > tmax) return -1.0f;
+    return (tmin > 0.001f) ? tmin : ((tmax > 0.001f) ? tmax : -1.0f);
+  }
+  else if (type == TYPE_TORUS) {
+    float R = param0.x;  // major radius
+    float r = param0.y;  // minor radius
+
+    // Bounding sphere early-out
+    float bound = R + r;
+    float b = dot(oc, rd);
+    float c = dot(oc, oc) - bound * bound;
+    if (b*b - c < 0.0f) return -1.0f;
+
+    // Quartic coefficients for torus
+    float Ra2 = R * R;
+    float ra2 = r * r;
+    float m = dot(oc, oc);
+    float n = dot(oc, rd);
+    float k = (m - ra2 - Ra2) / 2.0f;
+    float k3 = n;
+    float k2 = n*n + Ra2*rd.y*rd.y + k;
+    float k1 = k*n + Ra2*oc.y*rd.y;
+    float k0 = k*k + Ra2*oc.y*oc.y - Ra2*ra2;
+
+    // Solve quartic via resolvent cubic
+    float po = 1.0f;
+    if (fabs(k3*(k3*k3 - k2) + k1) < 0.01f) {
+      po = -1.0f;
+      float tmp = k1; k1 = k3; k3 = tmp;
+      k0 = 1.0f / k0;
+      k1 = k1 * k0;
+      k2 = k2 * k0;
+      k3 = k3 * k0;
+    }
+
+    float c2 = 2.0f*k2 - 3.0f*k3*k3;
+    float c1 = k3*(k3*k3 - k2) + k1;
+    float c0 = k3*(k3*(-3.0f*k3*k3 + 4.0f*k2) - 8.0f*k1) + 4.0f*k0;
+
+    c2 /= 3.0f;
+    c1 *= 2.0f;
+    c0 /= 3.0f;
+
+    float Q = c2*c2 + c0;
+    float R2 = 3.0f*c0*c2 - c2*c2*c2 - c1*c1;
+
+    float h = R2*R2 - Q*Q*Q;
+    float z;
+
+    if (h < 0.0f) {
+      float sQ = sqrt(Q);
+      z = 2.0f * sQ * cos(acos(clamp(R2/(sQ*Q), -1.0f, 1.0f)) / 3.0f);
+    } else {
+      float sQ = pow(sqrt(h) + fabs(R2), 1.0f/3.0f);
+      z = sign(R2) * fabs(sQ + Q/sQ);
+    }
+    z = c2 - z;
+
+    float d1 = z - 3.0f*c2;
+    float d2 = z*z - c0;
+    if (fabs(d1) < 1.0e-4f) {
+      if (d2 < 0.0f) return -1.0f;
+      d2 = sqrt(d2);
+    } else {
+      if (d1 < 0.0f) return -1.0f;
+      d1 = sqrt(d1 / 2.0f);
+      d2 = c1 / d1;
+    }
+
+    float result = 1e30f;
+    h = d1*d1 - z + d2;
+    if (h > 0.0f) {
+      h = sqrt(h);
+      float t1 = -d1 - h - k3; t1 = (po < 0.0f) ? 2.0f/t1 : t1;
+      float t2 = -d1 + h - k3; t2 = (po < 0.0f) ? 2.0f/t2 : t2;
+      if (t1 > 0.001f) result = fmin(result, t1);
+      if (t2 > 0.001f) result = fmin(result, t2);
+    }
+    h = d1*d1 - z - d2;
+    if (h > 0.0f) {
+      h = sqrt(h);
+      float t1 = d1 - h - k3; t1 = (po < 0.0f) ? 2.0f/t1 : t1;
+      float t2 = d1 + h - k3; t2 = (po < 0.0f) ? 2.0f/t2 : t2;
+      if (t1 > 0.001f) result = fmin(result, t1);
+      if (t2 > 0.001f) result = fmin(result, t2);
+    }
+
+    return (result < 1e29f) ? result : -1.0f;
+  }
+
+  return -1.0f;
+}
+
+// GPU-optimized BVH traversal with branchless child ordering
+// Uses direction sign to order near/far children for early termination
+float trace_bvh_gpu(float3 ro, float3 rd, float eps,
+                    __global bvh_node_gpu *bvh, int bvh_count,
+                    __global float4 *prim_pos,
+                    __global float4 *prim_param0,
+                    __global float4 *prim_param1,
+                    int *out_hit_idx) {
+  *out_hit_idx = -1;
+  if (bvh_count <= 0) return INFINITY;
+
+  float closest_t = INFINITY;
+
+  // Precompute ray properties (done once per ray)
+  float3 inv_rd = native_recip(rd);
+  int3 dir_sign = (int3)(rd.x < 0.0f, rd.y < 0.0f, rd.z < 0.0f);
+
+  // Stack-based traversal (32 entries handles trees up to 2^32 nodes)
+  int stack[16];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    int node_idx = stack[--stack_ptr];
+    __global bvh_node_gpu *node = &bvh[node_idx];
+
+    // AABB test
+    float2 t_box = intersect_aabb_gpu(ro, inv_rd, dir_sign,
+                                       node->bbox_min.xyz, node->bbox_max.xyz);
+    // Early reject: miss or farther than current hit
+    if (t_box.y < 0.0f || t_box.x > t_box.y || t_box.x > closest_t)
+      continue;
+
+    int left = node->child[0];
+    int right = node->child[1];
+
+    // Check if leaf (negative child index encodes leaf)
+    if (left < 0) {
+      // Leaf: decode primitive range
+      int prim_start = ~left;  // bitwise NOT to get start index
+      int prim_count = node->prim_count[0];
+
+      for (int i = 0; i < prim_count; i++) {
+        int prim_idx = prim_start + i;
+        float t = intersect_prim_soa(ro, rd, prim_pos, prim_param0, prim_param1, prim_idx);
+        if (t > eps && t < closest_t) {
+          closest_t = t;
+          *out_hit_idx = prim_idx;
+        }
+      }
+    } else {
+      // Internal node: order children by ray direction for better culling
+      // If ray goes in positive direction along split axis, visit left (near) first
+      int axis = node->axis;
+      int near_child, far_child;
+
+      // Branchless selection: dir_sign[axis] ? right : left
+      int swap = (axis == 0) ? dir_sign.x : ((axis == 1) ? dir_sign.y : dir_sign.z);
+      near_child = swap ? right : left;
+      far_child = swap ? left : right;
+
+      // Push far child first (will be popped last)
+      stack[stack_ptr++] = far_child;
+      stack[stack_ptr++] = near_child;
+    }
+  }
+
+  return closest_t;
+}
+
+// GPU shadow ray test - returns true if occluded (early exit on first hit)
+bool trace_shadow_gpu(float3 ro, float3 rd, float max_dist, float eps,
+                      __global bvh_node_gpu *bvh, int bvh_count,
+                      __global float4 *prim_pos,
+                      __global float4 *prim_param0,
+                      __global float4 *prim_param1) {
+  if (bvh_count <= 0) return false;
+
+  float3 inv_rd = native_recip(rd);
+  int3 dir_sign = (int3)(rd.x < 0.0f, rd.y < 0.0f, rd.z < 0.0f);
+
+  int stack[16];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    int node_idx = stack[--stack_ptr];
+    __global bvh_node_gpu *node = &bvh[node_idx];
+
+    float2 t_box = intersect_aabb_gpu(ro, inv_rd, dir_sign,
+                                       node->bbox_min.xyz, node->bbox_max.xyz);
+    if (t_box.y < 0.0f || t_box.x > t_box.y || t_box.x > max_dist)
+      continue;
+
+    int left = node->child[0];
+
+    if (left < 0) {
+      int prim_start = ~left;
+      int prim_count = node->prim_count[0];
+
+      for (int i = 0; i < prim_count; i++) {
+        int prim_idx = prim_start + i;
+        float t = intersect_prim_soa(ro, rd, prim_pos, prim_param0, prim_param1, prim_idx);
+        if (t > eps && t < max_dist) return true;  // Early exit!
+      }
+    } else {
+      int right = node->child[1];
+      stack[stack_ptr++] = right;
+      stack[stack_ptr++] = left;
+    }
+  }
+
+  return false;
+}
+
 float3 reflect_vec(float3 I, float3 N) {
   return I - 2.0f * dot(N, I) * N;
+}
+
+// Rotate vector by Euler angles (in radians) - X, Y, Z order
+float3 rotate_euler(float3 v, float3 rot) {
+  if (rot.x == 0.0f && rot.y == 0.0f && rot.z == 0.0f) return v;
+
+  float cx = cos(rot.x), sx = sin(rot.x);
+  float cy = cos(rot.y), sy = sin(rot.y);
+  float cz = cos(rot.z), sz = sin(rot.z);
+
+  // Rotation around X axis
+  float y1 = v.y * cx - v.z * sx;
+  float z1 = v.y * sx + v.z * cx;
+  v.y = y1; v.z = z1;
+
+  // Rotation around Y axis
+  float x2 = v.x * cy + v.z * sy;
+  float z2 = -v.x * sy + v.z * cy;
+  v.x = x2; v.z = z2;
+
+  // Rotation around Z axis
+  float x3 = v.x * cz - v.y * sz;
+  float y3 = v.x * sz + v.y * cz;
+  v.x = x3; v.y = y3;
+
+  return v;
+}
+
+// Inverse rotation (for transforming points to local space)
+float3 rotate_euler_inv(float3 v, float3 rot) {
+  if (rot.x == 0.0f && rot.y == 0.0f && rot.z == 0.0f) return v;
+
+  float cx = cos(rot.x), sx = sin(rot.x);
+  float cy = cos(rot.y), sy = sin(rot.y);
+  float cz = cos(rot.z), sz = sin(rot.z);
+
+  // Inverse rotation around Z axis
+  float x1 = v.x * cz + v.y * sz;
+  float y1 = -v.x * sz + v.y * cz;
+  v.x = x1; v.y = y1;
+
+  // Inverse rotation around Y axis
+  float x2 = v.x * cy - v.z * sy;
+  float z2 = v.x * sy + v.z * cy;
+  v.x = x2; v.z = z2;
+
+  // Inverse rotation around X axis
+  float y3 = v.y * cx + v.z * sx;
+  float z3 = -v.y * sx + v.z * cx;
+  v.y = y3; v.z = z3;
+
+  return v;
 }
 
 float3 refract_vec(float3 I, float3 N, float eta) {
@@ -114,7 +444,9 @@ float fresnel(float3 I, float3 N, float ior) {
   r0 = r0 * r0;
   float cosX = -dot(N, I);
   if (ior > 1.0f && cosX < 0.0f) cosX = dot(N, I);
-  return r0 + (1.0f - r0) * pow(1.0f - cosX, 5.0f);
+  float x = 1.0f - cosX;
+  float x2 = x * x;
+  return r0 + (1.0f - r0) * (x2 * x2 * x);  // x^5 = x^2 * x^2 * x
 }
 
 float intersect_sphere(float3 ro, float3 rd, __global t_object *s) {
@@ -463,7 +795,7 @@ float trace_bvh(float3 ro, float3 rd, float eps,
   float3 inv_rd = (float3)(1.0f / rd.x, 1.0f / rd.y, 1.0f / rd.z);
 
   // Stack-based BVH traversal
-  int stack[32];
+  int stack[16];
   int stack_ptr = 0;
   stack[stack_ptr++] = 0;
 
@@ -493,6 +825,47 @@ float trace_bvh(float3 ro, float3 rd, float eps,
   }
 
   return closest_t;
+}
+
+// Shadow ray test - returns true if occluded (early exit on first hit)
+bool trace_shadow(float3 ro, float3 rd, float max_dist, float eps,
+                  __global t_object *objects, int obj_count,
+                  __global t_bvh_node *bvh, int bvh_count) {
+  // If no BVH, use linear search with early exit
+  if (bvh_count <= 0) {
+    for (int i = 0; i < obj_count; i++) {
+      float t = intersect_object(ro, rd, &objects[i]);
+      if (t > eps && t < max_dist) return true;  // Early exit!
+    }
+    return false;
+  }
+
+  float3 inv_rd = (float3)(1.0f / rd.x, 1.0f / rd.y, 1.0f / rd.z);
+
+  int stack[16];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    int node_idx = stack[--stack_ptr];
+    __global t_bvh_node *node = &bvh[node_idx];
+
+    float box_t = intersect_aabb(ro, inv_rd, node->bounds);
+    if (box_t > max_dist || box_t == INFINITY) continue;
+
+    if (node->left == -1) {
+      for (int i = 0; i < node->obj_count; i++) {
+        int obj_i = node->obj_start + i;
+        float t = intersect_object(ro, rd, &objects[obj_i]);
+        if (t > eps && t < max_dist) return true;  // Early exit!
+      }
+    } else {
+      stack[stack_ptr++] = node->right;
+      stack[stack_ptr++] = node->left;
+    }
+  }
+
+  return false;
 }
 
 float3 get_color(
@@ -566,12 +939,11 @@ float3 get_color(
         attenuation *= smoothstep(outer_cos, cone_cos, spot_cos);
       }
 
-      // Shadow ray
+      // Shadow ray with early exit
       float3 shadow_ro = hit_p + n * eps;
-      int shadow_idx;
-      float shadow_t = trace_bvh(shadow_ro, l_dir, eps, objects, obj_count, bvh, bvh_count, &shadow_idx);
+      bool in_shadow = trace_shadow(shadow_ro, l_dir, l_dist, eps, objects, obj_count, bvh, bvh_count);
 
-      if (shadow_t > l_dist) {
+      if (!in_shadow) {
         float ndotl = max(dot(n, l_dir), 0.0f);
         diffuse += obj->mat.color.xyz * light->color.xyz * ndotl * light->intensity * attenuation;
       }
@@ -581,6 +953,8 @@ float3 get_color(
     float3 local_col = (diffuse + ambient * obj->mat.color.xyz);
 
     if (obj->mat.transparency > 0.0f) {
+      // Accumulate surface contribution before refraction/reflection
+      accum_color += local_col * mask * (1.0f - obj->mat.transparency);
       float eta = outside ? (1.0f / obj->mat.ior) : obj->mat.ior;
       float fr = fresnel(rd, n, obj->mat.ior);
       if (fr > 0.5f) {
@@ -646,4 +1020,295 @@ __kernel void render_kernel(
   uint g = min((uint)(col.y * 255.99f), 255u);
   uint b = min((uint)(col.z * 255.99f), 255u);
   output[y * width + x] = (r << 16) | (g << 8) | b;
+}
+
+// =============================================================================
+// GPU-OPTIMIZED BATCHED RAY TRACING KERNEL
+// =============================================================================
+
+// Ray buffer structure for batched processing
+typedef struct {
+  float4 origin;     // xyz = origin, w = tmin
+  float4 direction;  // xyz = direction, w = tmax
+} ray_data;
+
+// Hit result structure
+typedef struct {
+  float t;           // Hit distance (INFINITY if miss)
+  int prim_idx;      // Primitive index (-1 if miss)
+  int pad[2];
+} hit_data;
+
+// Get normal for SoA primitive at hit point
+float3 get_normal_soa(float3 hit_p, float3 local_p, int type,
+                      __global float4 *prim_param0,
+                      __global float4 *prim_param1,
+                      int idx) {
+  float4 param0 = prim_param0[idx];
+
+  if (type == TYPE_SPHERE) {
+    return normalize(local_p);
+  }
+  else if (type == TYPE_PLANE) {
+    float4 param1 = prim_param1[idx];
+    return normalize(param1.xyz);
+  }
+  else if (type == TYPE_BOX) {
+    float3 hs = param0.xyz;
+    float3 d = fabs(local_p) - hs;
+    float eps = 0.001f;
+    float3 n = (float3)(0, 0, 0);
+    if (fabs(d.x) < eps) n.x = sign(local_p.x);
+    else if (fabs(d.y) < eps) n.y = sign(local_p.y);
+    else if (fabs(d.z) < eps) n.z = sign(local_p.z);
+    return normalize(n);
+  }
+  else if (type == TYPE_TORUS) {
+    float R = param0.x;  // major radius
+    float k = sqrt(local_p.x*local_p.x + local_p.z*local_p.z);
+    float3 n;
+    n.x = local_p.x * (1.0f - R / k);
+    n.y = local_p.y;
+    n.z = local_p.z * (1.0f - R / k);
+    return normalize(n);
+  }
+
+  return (float3)(0, 1, 0);
+}
+
+// Batched ray-BVH intersection kernel
+// Processes rays in parallel, outputs hit results
+// Designed for minimal divergence and coalesced memory access
+__kernel void trace_rays_gpu(
+    __global ray_data *rays,
+    __global hit_data *hits,
+    int ray_count,
+    __global bvh_node_gpu *bvh,
+    int bvh_count,
+    __global float4 *prim_pos,
+    __global float4 *prim_param0,
+    __global float4 *prim_param1,
+    float epsilon) {
+
+  int ray_idx = get_global_id(0);
+  if (ray_idx >= ray_count) return;
+
+  // Load ray data (coalesced read)
+  ray_data ray = rays[ray_idx];
+  float3 ro = ray.origin.xyz;
+  float3 rd = ray.direction.xyz;
+  float tmin = ray.origin.w;
+  float tmax = ray.direction.w;
+
+  // Initialize result
+  hit_data hit;
+  hit.t = INFINITY;
+  hit.prim_idx = -1;
+
+  if (bvh_count <= 0) {
+    hits[ray_idx] = hit;
+    return;
+  }
+
+  // Precompute ray properties
+  float3 inv_rd = native_recip(rd);
+  int3 dir_sign = (int3)(rd.x < 0.0f, rd.y < 0.0f, rd.z < 0.0f);
+
+  // Stack-based traversal
+  int stack[16];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  float closest_t = tmax;
+
+  while (stack_ptr > 0) {
+    int node_idx = stack[--stack_ptr];
+    __global bvh_node_gpu *node = &bvh[node_idx];
+
+    // Branchless AABB test
+    float2 t_box = intersect_aabb_gpu(ro, inv_rd, dir_sign,
+                                       node->bbox_min.xyz, node->bbox_max.xyz);
+
+    // Skip if miss or farther than closest hit
+    float box_tmin = fmax(t_box.x, tmin);
+    float box_tmax = fmin(t_box.y, closest_t);
+    if (box_tmax < box_tmin) continue;
+
+    int left = node->child[0];
+
+    if (left < 0) {
+      // Leaf node: test primitives
+      int prim_start = ~left;
+      int prim_count = node->prim_count[0];
+
+      for (int i = 0; i < prim_count; i++) {
+        int prim_idx = prim_start + i;
+        float t = intersect_prim_soa(ro, rd, prim_pos, prim_param0, prim_param1, prim_idx);
+
+        if (t > epsilon && t < closest_t) {
+          closest_t = t;
+          hit.t = t;
+          hit.prim_idx = prim_idx;
+        }
+      }
+    } else {
+      // Internal node: order children by ray direction
+      int right = node->child[1];
+      int axis = node->axis;
+
+      // Branchless near/far selection
+      int swap = (axis == 0) ? dir_sign.x : ((axis == 1) ? dir_sign.y : dir_sign.z);
+      int near_child = swap ? right : left;
+      int far_child = swap ? left : right;
+
+      // Push far first (processed last)
+      stack[stack_ptr++] = far_child;
+      stack[stack_ptr++] = near_child;
+    }
+  }
+
+  // Write result (coalesced write)
+  hits[ray_idx] = hit;
+}
+
+// Full GPU render with optimized BVH (SoA layout)
+// This kernel uses the GPU-optimized structures for better performance
+__kernel void render_kernel_gpu(
+    __global uint *output,
+    int width,
+    int height,
+    t_camera cam,
+    __global bvh_node_gpu *bvh,
+    int bvh_count,
+    __global float4 *prim_pos,
+    __global float4 *prim_param0,
+    __global float4 *prim_param1,
+    __global float4 *prim_mat_color,
+    __global float4 *prim_mat_props,
+    int prim_count,
+    __global t_light *lights,
+    int light_count,
+    float4 ambient,
+    float4 background,
+    t_render render) {
+
+  int x = get_global_id(0);
+  int y = get_global_id(1);
+  if (x >= width || y >= height) return;
+
+  // Generate primary ray
+  float aspect = (float)width / height;
+  float scale = tan(cam.fov * 0.5f * M_PI_F / 180.0f);
+  float px = (2.0f * (x + 0.5f) / width - 1.0f) * aspect * scale;
+  float py = (1.0f - 2.0f * (y + 0.5f) / height) * scale;
+
+  float3 forward = normalize(cam.dir.xyz);
+  float3 right = normalize(cross(forward, (float3)(0, 1, 0)));
+  if (length(right) < 0.001f) right = (float3)(1, 0, 0);
+  float3 up = cross(right, forward);
+
+  float3 ro = cam.pos.xyz;
+  float3 rd = normalize(px * right + py * up + forward);
+
+  // Precompute ray properties (reused for all bounces)
+  float eps = render.epsilon;
+
+  float3 accum_color = (float3)(0, 0, 0);
+  float3 mask = (float3)(1, 1, 1);
+
+  for (int bounce = 0; bounce < render.max_bounces; bounce++) {
+    // Trace ray using GPU-optimized BVH
+    int hit_idx;
+    float closest_t = trace_bvh_gpu(ro, rd, eps, bvh, bvh_count,
+                                     prim_pos, prim_param0, prim_param1, &hit_idx);
+
+    if (hit_idx < 0) {
+      accum_color += background.xyz * mask;
+      break;
+    }
+
+    // Get hit info from SoA buffers
+    float4 pos4 = prim_pos[hit_idx];
+    float3 obj_pos = pos4.xyz;
+    int type = as_int(pos4.w);
+
+    float3 hit_p = ro + rd * closest_t;
+    float3 local_p = hit_p - obj_pos;
+
+    float3 n = get_normal_soa(hit_p, local_p, type, prim_param0, prim_param1, hit_idx);
+
+    bool outside = dot(rd, n) < 0.0f;
+    if (!outside) n = -n;
+
+    // Get material from SoA
+    float4 mat_color = prim_mat_color[hit_idx];
+    float4 mat_props = prim_mat_props[hit_idx];
+    float reflection = mat_props.x;
+    float transparency = mat_props.y;
+    float ior = mat_props.z;
+
+    // Compute diffuse lighting
+    float3 diffuse = (float3)(0, 0, 0);
+    for (int i = 0; i < light_count; i++) {
+      __global t_light *light = &lights[i];
+      float3 l_dir;
+      float l_dist;
+      float attenuation = 1.0f;
+
+      if (light->type == LIGHT_DIRECTIONAL) {
+        l_dir = -normalize(light->dir.xyz);
+        l_dist = 1e30f;
+      } else {
+        l_dir = light->pos.xyz - hit_p;
+        l_dist = length(l_dir);
+        l_dir = normalize(l_dir);
+      }
+
+      // Shadow ray with early exit
+      float3 shadow_ro = hit_p + n * eps;
+      bool in_shadow = trace_shadow_gpu(shadow_ro, l_dir, l_dist, eps, bvh, bvh_count,
+                                        prim_pos, prim_param0, prim_param1);
+
+      if (!in_shadow) {
+        float ndotl = fmax(dot(n, l_dir), 0.0f);
+        diffuse += mat_color.xyz * light->color.xyz * ndotl * light->intensity * attenuation;
+      }
+    }
+
+    float3 local_col = diffuse + ambient.xyz * mat_color.xyz;
+
+    if (transparency > 0.0f) {
+      // Accumulate surface contribution before refraction/reflection
+      accum_color += local_col * mask * (1.0f - transparency);
+      float eta = outside ? (1.0f / ior) : ior;
+      float fr = fresnel(rd, n, ior);
+      if (fr > 0.5f) {
+        rd = reflect_vec(rd, n);
+        ro = hit_p + n * eps;
+      } else {
+        float3 refr = refract_vec(rd, n, eta);
+        if (length(refr) < eps) rd = reflect_vec(rd, n);
+        else rd = refr;
+        ro = hit_p - n * eps;
+      }
+      mask *= transparency;
+    } else if (reflection > 0.0f) {
+      accum_color += local_col * mask * (1.0f - reflection);
+      mask *= reflection;
+      rd = reflect_vec(rd, n);
+      ro = hit_p + n * eps;
+    } else {
+      accum_color += local_col * mask;
+      break;
+    }
+  }
+
+  // Tonemap and gamma
+  accum_color = (float3)(1.0f) - exp(-accum_color * render.exposure);
+  accum_color = pow(accum_color, (float3)(1.0f / render.gamma));
+
+  uint r = min((uint)(accum_color.x * 255.99f), 255u);
+  uint g = min((uint)(accum_color.y * 255.99f), 255u);
+  uint b_val = min((uint)(accum_color.z * 255.99f), 255u);
+  output[y * width + x] = (r << 16) | (g << 8) | b_val;
 }

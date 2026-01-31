@@ -1,5 +1,8 @@
 #include "minirt.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 
 static char *load_kernel_source(const char *filename) {
   FILE *f = fopen(filename, "r");
@@ -91,7 +94,6 @@ void init_opencl(t_data *data) {
 void render_opencl(t_data *data) {
   cl_int err;
 
-  // Set Arguments
   clSetKernelArg(data->cl.kernel, 0, sizeof(cl_mem), &data->cl.output_buffer);
   clSetKernelArg(data->cl.kernel, 1, sizeof(int), &data->scene.width);
   clSetKernelArg(data->cl.kernel, 2, sizeof(int), &data->scene.height);
@@ -106,9 +108,14 @@ void render_opencl(t_data *data) {
   clSetKernelArg(data->cl.kernel, 11, sizeof(cl_mem), &data->cl.bvh_buffer);
   clSetKernelArg(data->cl.kernel, 12, sizeof(int), &data->scene.bvh_node_count);
 
-  // Enqueue Kernel
-  size_t global_work[2] = { (size_t)data->scene.width, (size_t)data->scene.height };
-  err = clEnqueueNDRangeKernel(data->cl.queue, data->cl.kernel, 2, NULL, global_work, NULL, 0, NULL, NULL);
+  // Enqueue Kernel with explicit work group size for better GPU occupancy
+  size_t local_work[2] = { 16, 16 };  // 256 threads per work group
+  // Round up global work size to be divisible by local work size
+  size_t global_work[2] = {
+    ((data->scene.width + local_work[0] - 1) / local_work[0]) * local_work[0],
+    ((data->scene.height + local_work[1] - 1) / local_work[1]) * local_work[1]
+  };
+  err = clEnqueueNDRangeKernel(data->cl.queue, data->cl.kernel, 2, NULL, global_work, local_work, 0, NULL, NULL);
   check_error(err, "Enqueue Kernel");
 
   // Read Result (packed uint - direct copy to MLX image)
@@ -256,4 +263,244 @@ void upload_bvh(t_data *data) {
                                          CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                          sizeof(t_bvh_node), &dummy, &err);
   }
+}
+
+// =============================================================================
+// GPU-OPTIMIZED BVH AND SOA PRIMITIVE SUPPORT
+// =============================================================================
+
+// Determine split axis from existing BVH node bounds (largest extent)
+static int compute_split_axis(const t_bvh_node *node, const t_bvh_node *nodes) {
+  if (node->left < 0) return 0;  // Leaf node
+
+  // Get child bounds to determine split axis
+  const t_bvh_node *left = &nodes[node->left];
+  const t_bvh_node *right = &nodes[node->right];
+
+  // Use centroid difference to determine axis
+  float left_cx = (left->bounds.min.s[0] + left->bounds.max.s[0]) * 0.5f;
+  float left_cy = (left->bounds.min.s[1] + left->bounds.max.s[1]) * 0.5f;
+  float left_cz = (left->bounds.min.s[2] + left->bounds.max.s[2]) * 0.5f;
+
+  float right_cx = (right->bounds.min.s[0] + right->bounds.max.s[0]) * 0.5f;
+  float right_cy = (right->bounds.min.s[1] + right->bounds.max.s[1]) * 0.5f;
+  float right_cz = (right->bounds.min.s[2] + right->bounds.max.s[2]) * 0.5f;
+
+  float dx = fabsf(right_cx - left_cx);
+  float dy = fabsf(right_cy - left_cy);
+  float dz = fabsf(right_cz - left_cz);
+
+  if (dx >= dy && dx >= dz) return 0;
+  if (dy >= dz) return 1;
+  return 2;
+}
+
+// Flatten BVH to GPU-optimized format with branchless traversal support
+t_bvh_node_gpu *flatten_bvh_for_gpu(const t_bvh_node *nodes, int node_count,
+                                     int *out_gpu_node_count) {
+  if (node_count <= 0) {
+    *out_gpu_node_count = 0;
+    return NULL;
+  }
+
+  t_bvh_node_gpu *gpu_nodes = calloc(node_count, sizeof(t_bvh_node_gpu));
+  *out_gpu_node_count = node_count;
+
+  // Build parent pointers (for optional stackless traversal)
+  int *parents = calloc(node_count, sizeof(int));
+  parents[0] = -1;  // Root has no parent
+
+  for (int i = 0; i < node_count; i++) {
+    const t_bvh_node *src = &nodes[i];
+    if (src->left >= 0) {
+      parents[src->left] = i;
+      parents[src->right] = i;
+    }
+  }
+
+  // Convert each node
+  for (int i = 0; i < node_count; i++) {
+    const t_bvh_node *src = &nodes[i];
+    t_bvh_node_gpu *dst = &gpu_nodes[i];
+
+    // Copy bounds
+    dst->bbox_min = src->bounds.min;
+    dst->bbox_max = src->bounds.max;
+    dst->parent = parents[i];
+
+    if (src->left < 0) {
+      // Leaf node: encode primitive start as ~index (bitwise NOT)
+      dst->child[0] = ~src->obj_start;  // Negative signals leaf
+      dst->child[1] = -1;
+      dst->prim_count[0] = src->obj_count;
+      dst->prim_count[1] = 0;
+      dst->axis = 0;
+    } else {
+      // Internal node
+      dst->child[0] = src->left;
+      dst->child[1] = src->right;
+      dst->prim_count[0] = 0;
+      dst->prim_count[1] = 0;
+      dst->axis = compute_split_axis(src, nodes);
+    }
+  }
+
+  free(parents);
+  return gpu_nodes;
+}
+
+// Convert AoS objects to SoA layout for coalesced GPU memory access
+void convert_objects_to_soa(const t_object *objects, int count, t_primitives_soa *soa) {
+  soa->count = count;
+  soa->pos = malloc(count * sizeof(cl_float4));
+  soa->param0 = malloc(count * sizeof(cl_float4));
+  soa->param1 = malloc(count * sizeof(cl_float4));
+  soa->param2 = malloc(count * sizeof(cl_float4));
+  soa->param3 = malloc(count * sizeof(cl_float4));
+  soa->mat_color = malloc(count * sizeof(cl_float4));
+  soa->mat_props = malloc(count * sizeof(cl_float4));
+
+  for (int i = 0; i < count; i++) {
+    const t_object *obj = &objects[i];
+
+    // Position with type encoded in w
+    soa->pos[i] = obj->pos;
+    soa->pos[i].s[3] = *(float *)&obj->type;  // Type as float bits
+
+    // Material properties
+    soa->mat_color[i] = obj->mat.color;
+    soa->mat_props[i] = (cl_float4){{
+      obj->mat.reflection,
+      obj->mat.transparency,
+      obj->mat.ior,
+      obj->mat.roughness
+    }};
+
+    // Zero-initialize params
+    soa->param0[i] = (cl_float4){{0, 0, 0, 0}};
+    soa->param1[i] = (cl_float4){{0, 0, 0, 0}};
+    soa->param2[i] = (cl_float4){{0, 0, 0, 0}};
+    soa->param3[i] = (cl_float4){{0, 0, 0, 0}};
+
+    // Pack type-specific parameters
+    switch (obj->type) {
+      case TYPE_SPHERE:
+        soa->param0[i].s[0] = obj->sphere.radius;
+        soa->param0[i].s[3] = *(float *)&obj->material_id;
+        break;
+
+      case TYPE_PLANE:
+        soa->param0[i].s[3] = *(float *)&obj->material_id;
+        soa->param1[i] = obj->plane.normal;
+        break;
+
+      case TYPE_BOX:
+        soa->param0[i] = obj->box.half_size;
+        soa->param0[i].s[3] = *(float *)&obj->material_id;
+        break;
+
+      case TYPE_QUADRIC:
+        // Spread 10 coefficients across param0-param3
+        soa->param0[i] = (cl_float4){{
+          obj->quadric.coeffs[0], obj->quadric.coeffs[1],
+          obj->quadric.coeffs[2], *(float *)&obj->material_id
+        }};
+        soa->param1[i] = (cl_float4){{
+          obj->quadric.coeffs[3], obj->quadric.coeffs[4],
+          obj->quadric.coeffs[5], obj->quadric.coeffs[6]
+        }};
+        soa->param2[i] = (cl_float4){{
+          obj->quadric.coeffs[7], obj->quadric.coeffs[8],
+          obj->quadric.coeffs[9], 0
+        }};
+        break;
+
+      case TYPE_TORUS:
+        soa->param0[i].s[0] = obj->torus.major;
+        soa->param0[i].s[1] = obj->torus.minor;
+        soa->param0[i].s[3] = *(float *)&obj->material_id;
+        break;
+
+      case TYPE_MOBIUS:
+        soa->param0[i].s[0] = obj->mobius.radius;
+        soa->param0[i].s[1] = obj->mobius.width;
+        soa->param0[i].s[3] = *(float *)&obj->material_id;
+        break;
+    }
+  }
+}
+
+// Free SoA primitive arrays
+void free_primitives_soa(t_primitives_soa *soa) {
+  free(soa->pos);
+  free(soa->param0);
+  free(soa->param1);
+  free(soa->param2);
+  free(soa->param3);
+  free(soa->mat_color);
+  free(soa->mat_props);
+  soa->count = 0;
+}
+
+// Upload GPU-optimized BVH and SoA primitives
+t_gpu_buffers *create_gpu_bvh_buffers(t_data *data) {
+  cl_int err;
+  t_gpu_buffers *bufs = calloc(1, sizeof(t_gpu_buffers));
+
+  // Flatten BVH to GPU format
+  int gpu_node_count;
+  t_bvh_node_gpu *gpu_nodes = flatten_bvh_for_gpu(
+    data->scene.bvh_nodes, data->scene.bvh_node_count, &gpu_node_count);
+
+  if (gpu_node_count > 0) {
+    bufs->bvh_gpu = clCreateBuffer(data->cl.context,
+                                   CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(t_bvh_node_gpu) * gpu_node_count,
+                                   gpu_nodes, &err);
+    check_error(err, "BVH GPU buffer");
+    free(gpu_nodes);
+  }
+
+  // Convert objects to SoA
+  t_primitives_soa soa;
+  convert_objects_to_soa(data->scene.objects, data->scene.obj_count, &soa);
+
+  bufs->prim_pos = clCreateBuffer(data->cl.context,
+                                  CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                  sizeof(cl_float4) * soa.count, soa.pos, &err);
+  bufs->prim_param0 = clCreateBuffer(data->cl.context,
+                                     CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     sizeof(cl_float4) * soa.count, soa.param0, &err);
+  bufs->prim_param1 = clCreateBuffer(data->cl.context,
+                                     CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     sizeof(cl_float4) * soa.count, soa.param1, &err);
+  bufs->prim_param2 = clCreateBuffer(data->cl.context,
+                                     CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     sizeof(cl_float4) * soa.count, soa.param2, &err);
+  bufs->prim_param3 = clCreateBuffer(data->cl.context,
+                                     CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     sizeof(cl_float4) * soa.count, soa.param3, &err);
+  bufs->prim_mat_color = clCreateBuffer(data->cl.context,
+                                        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        sizeof(cl_float4) * soa.count, soa.mat_color, &err);
+  bufs->prim_mat_props = clCreateBuffer(data->cl.context,
+                                        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        sizeof(cl_float4) * soa.count, soa.mat_props, &err);
+
+  free_primitives_soa(&soa);
+  return bufs;
+}
+
+// Release GPU buffers
+void release_gpu_bvh_buffers(t_gpu_buffers *bufs) {
+  if (!bufs) return;
+  if (bufs->bvh_gpu) clReleaseMemObject(bufs->bvh_gpu);
+  if (bufs->prim_pos) clReleaseMemObject(bufs->prim_pos);
+  if (bufs->prim_param0) clReleaseMemObject(bufs->prim_param0);
+  if (bufs->prim_param1) clReleaseMemObject(bufs->prim_param1);
+  if (bufs->prim_param2) clReleaseMemObject(bufs->prim_param2);
+  if (bufs->prim_param3) clReleaseMemObject(bufs->prim_param3);
+  if (bufs->prim_mat_color) clReleaseMemObject(bufs->prim_mat_color);
+  if (bufs->prim_mat_props) clReleaseMemObject(bufs->prim_mat_props);
+  free(bufs);
 }

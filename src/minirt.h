@@ -29,21 +29,6 @@ typedef struct {
   cl_uint *host_image_buffer; // Packed ARGB from GPU (no CPU conversion)
 } t_cl;
 
-typedef struct {
-  bool w;
-  bool s;
-  bool a;
-  bool d;
-  bool q;
-  bool e;
-  bool left;
-  bool right;
-  bool up;
-  bool down;
-  bool shift;
-  bool space;
-} t_keys;
-
 #define KEY_MASK_W 0x0001
 #define KEY_MASK_A 0x0002
 #define KEY_MASK_S 0x0004
@@ -95,6 +80,14 @@ void build_bvh_with_progress(t_scene *scene,
                              void *ctx);
 void free_bvh(t_scene *scene);
 void debug_print_bvh(t_scene *scene);
+
+// GPU-optimized BVH
+t_bvh_node_gpu *flatten_bvh_for_gpu(const t_bvh_node *nodes, int node_count,
+                                     int *out_gpu_node_count);
+void convert_objects_to_soa(const t_object *objects, int count, t_primitives_soa *soa);
+void free_primitives_soa(t_primitives_soa *soa);
+t_gpu_buffers *create_gpu_bvh_buffers(t_data *data);
+void release_gpu_bvh_buffers(t_gpu_buffers *bufs);
 
 // CPU rendering (AVX2)
 void init_cpu_renderer(int num_threads);

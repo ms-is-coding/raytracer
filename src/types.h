@@ -1,16 +1,7 @@
 // scene_types.h
 #pragma once
 
-#ifdef __OPENCL_VERSION__
-#define HOST_DEVICE
-typedef float4 cl_float4;
-typedef float cl_float;
-typedef int cl_int;
-
-#else
 #include <CL/cl.h>
-#define HOST_DEVICE
-#endif
 
 typedef struct {
   cl_float4 pos;
@@ -101,3 +92,41 @@ typedef struct {
   cl_int obj_start;  // first object index (leaf only)
   cl_int obj_count;  // number of objects (leaf only)
 } t_bvh_node;
+
+// GPU-optimized BVH node (64 bytes, cache-line aligned)
+// Uses child indices packed with leaf flag for branchless traversal
+typedef struct {
+  cl_float4 bbox_min;    // xyz = min, w = unused
+  cl_float4 bbox_max;    // xyz = max, w = unused
+  cl_int child[2];       // child[0] = left, child[1] = right (negative = leaf: ~idx = first prim)
+  cl_int prim_count[2];  // number of primitives in each child (0 for internal)
+  cl_int parent;         // parent index for stackless traversal (optional)
+  cl_int axis;           // split axis (0=X, 1=Y, 2=Z) for child ordering
+  cl_int pad[2];         // padding to 64 bytes
+} t_bvh_node_gpu;
+
+// SoA primitive data for coalesced GPU access
+typedef struct {
+  cl_float4 *pos;        // positions (xyz) + type (w as int bits)
+  cl_float4 *param0;     // first param vec (sphere: radius,0,0,mat_id; box: half_size,mat_id; etc)
+  cl_float4 *param1;     // second param vec (plane: normal; quadric: coeffs[0-3]; etc)
+  cl_float4 *param2;     // third param vec (quadric: coeffs[4-7]; etc)
+  cl_float4 *param3;     // fourth param vec (quadric: coeffs[8-9],0,0; etc)
+  cl_float4 *mat_color;  // material color
+  cl_float4 *mat_props;  // reflection, transparency, ior, roughness
+  cl_int count;
+} t_primitives_soa;
+
+#ifndef __OPENCL_VERSION__
+// GPU buffer structure for optimized BVH (CPU-side only)
+typedef struct t_gpu_buffers {
+  cl_mem bvh_gpu;        // GPU-optimized BVH nodes
+  cl_mem prim_pos;       // SoA: positions + type
+  cl_mem prim_param0;    // SoA: param0
+  cl_mem prim_param1;    // SoA: param1
+  cl_mem prim_param2;    // SoA: param2
+  cl_mem prim_param3;    // SoA: param3
+  cl_mem prim_mat_color; // SoA: material color
+  cl_mem prim_mat_props; // SoA: material properties
+} t_gpu_buffers;
+#endif

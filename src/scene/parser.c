@@ -219,6 +219,13 @@ static void parse_object_property(t_parser *p, yaml_token key) {
     }
   } else if (key_matches(key, "pos")) {
     obj->pos = parse_vector(p);
+  } else if (key_matches(key, "rot")) {
+    cl_float4 rot_deg = parse_vector(p);
+    // Convert degrees to radians
+    obj->rot.s[0] = rot_deg.s[0] * 3.14159265f / 180.0f;
+    obj->rot.s[1] = rot_deg.s[1] * 3.14159265f / 180.0f;
+    obj->rot.s[2] = rot_deg.s[2] * 3.14159265f / 180.0f;
+    obj->rot.s[3] = 0.0f;
   } else if (key_matches(key, "radius")) {
     obj->sphere.radius = parse_number(p);
   } else if (key_matches(key, "normal")) {
